@@ -387,10 +387,27 @@ func (vb *VersioningBackend) DeleteBlob(param *DeleteBlobInput) (*DeleteBlobOutp
 		if v, ok := meta["fileuuid"]; ok && v != nil {
 			fileUUID = *v
 		}
-		if fileUUID != "" {
-			if _, snapErr := vb.snapshotVersion(param.Key, fileUUID, bytes.NewReader(data), size, true); snapErr != nil {
-				versionLog.Errorf("DeleteBlob: snapshot failed for %s: %v", param.Key, snapErr)
+	}
+
+	// Check if this delete is part of a rename (CopyBlob already moved the
+	// marker to the new path). If the marker's filepath differs from the
+	// path being deleted, the file was renamed — skip snapshot and marker
+	// update so we don't overwrite the marker set by CopyBlob.
+	isRenameCleanup := false
+	if fileUUID != "" {
+		markerKey := vb.versionPrefix + fileUUID + "/0"
+		markerResp, markerErr := vb.backend.HeadBlob(&HeadBlobInput{Key: markerKey})
+		if markerErr == nil && markerResp.Metadata != nil {
+			if fp, ok := markerResp.Metadata["filepath"]; ok && fp != nil && *fp != param.Key {
+				isRenameCleanup = true
+				versionLog.Debugf("DeleteBlob: skipping snapshot for %s (renamed to %s)", param.Key, *fp)
 			}
+		}
+	}
+
+	if fileUUID != "" && !isRenameCleanup {
+		if _, snapErr := vb.snapshotVersion(param.Key, fileUUID, bytes.NewReader(data), size, true); snapErr != nil {
+			versionLog.Errorf("DeleteBlob: snapshot failed for %s: %v", param.Key, snapErr)
 		}
 	}
 
@@ -399,8 +416,8 @@ func (vb *VersioningBackend) DeleteBlob(param *DeleteBlobInput) (*DeleteBlobOutp
 		return out, delErr
 	}
 
-	// Update marker to indicate file is deleted.
-	if fileUUID != "" {
+	// Update marker to indicate file is deleted (skip if this is a rename cleanup).
+	if fileUUID != "" && !isRenameCleanup {
 		markerKey := vb.versionPrefix + fileUUID + "/0"
 		timestamp := time.Now().UTC().Format(time.RFC3339)
 		markerMeta := map[string]*string{
