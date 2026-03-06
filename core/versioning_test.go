@@ -102,6 +102,7 @@ func readTestBlob(t *testing.T, backend StorageBackend, key string) string {
 }
 
 // listVersionKeys lists snapshot keys for a UUID, returning them sorted by version.
+// It skips version 0 which is the current-path marker, not a real snapshot.
 func listVersionKeys(t *testing.T, backend StorageBackend, versionPrefix, uuid string) []string {
 	t.Helper()
 	prefix := versionPrefix + uuid + "/"
@@ -112,7 +113,7 @@ func listVersionKeys(t *testing.T, backend StorageBackend, versionPrefix, uuid s
 	for _, item := range resp.Items {
 		if item.Key != nil {
 			suffix := strings.TrimPrefix(*item.Key, prefix)
-			if _, err := strconv.Atoi(suffix); err == nil {
+			if v, err := strconv.Atoi(suffix); err == nil && v > 0 {
 				keys = append(keys, *item.Key)
 			}
 		}
@@ -351,6 +352,19 @@ func TestVersioningFullLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	fileUUID := *head.Metadata["fileuuid"]
 	t.Logf("Step 1 - Created file with UUID: %s", fileUUID)
+
+	// 1b. Verify the current-path marker exists at .versions/{uuid}/0
+	markerKey := versionPrefix + fileUUID + "/0"
+	markerHead, err := raw.HeadBlob(&HeadBlobInput{Key: markerKey})
+	require.NoError(t, err, "Marker object should exist at version 0")
+	require.NotNil(t, markerHead.Metadata["marker"], "Marker should have marker metadata")
+	require.Equal(t, "true", *markerHead.Metadata["marker"])
+	require.NotNil(t, markerHead.Metadata["fileuuid"], "Marker should have fileuuid")
+	require.Equal(t, fileUUID, *markerHead.Metadata["fileuuid"])
+	require.NotNil(t, markerHead.Metadata["filepath"], "Marker should have filepath")
+	require.Equal(t, key, *markerHead.Metadata["filepath"])
+	require.NotNil(t, markerHead.Metadata["updated-at"], "Marker should have updated-at timestamp")
+	t.Logf("Step 1b - Marker validated at %s", markerKey)
 
 	// 2. Edit the file 3 times
 	putTestBlob(t, vb, key, "edit 1", nil)

@@ -33,10 +33,11 @@ var versionLog = log.GetLogger("versioning")
 // pendingSnapshot stores the old file content captured at MultipartBlobBegin
 // time so it can be snapshotted when the multipart upload commits.
 type pendingSnapshot struct {
-	uuid    string
-	key     string
-	content []byte
-	size    uint64
+	uuid      string
+	key       string
+	content   []byte
+	size      uint64
+	isNewFile bool // true when a new UUID was generated (no prior file existed)
 }
 
 // VersioningBackend wraps any StorageBackend and intercepts key write
@@ -205,6 +206,29 @@ func (vb *VersioningBackend) ListVersions(fileUUID string) ([]string, error) {
 	return keys, nil
 }
 
+// writeCurrentPathMarker creates or updates a marker object at .versions/{uuid}/0
+// that records the current path of the file. This enables UUID-to-path lookup.
+func (vb *VersioningBackend) writeCurrentPathMarker(fileUUID string, currentPath string) {
+	markerKey := vb.versionPrefix + fileUUID + "/0"
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+	meta := map[string]*string{
+		"fileuuid":   &fileUUID,
+		"filepath":   &currentPath,
+		"version":    PString("0"),
+		"marker":     PString("true"),
+		"updated-at": &timestamp,
+	}
+	_, err := vb.backend.PutBlob(&PutBlobInput{
+		Key:      markerKey,
+		Body:     bytes.NewReader(nil),
+		Size:     PUInt64(0),
+		Metadata: meta,
+	})
+	if err != nil {
+		versionLog.Errorf("writeCurrentPathMarker: failed for uuid=%s path=%s: %v", fileUUID, currentPath, err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // StorageBackend interface -- pass-through methods
 // ---------------------------------------------------------------------------
@@ -316,8 +340,10 @@ func (vb *VersioningBackend) PutBlob(param *PutBlobInput) (*PutBlobOutput, error
 	}
 
 	// If we still have no UUID, check the incoming metadata or generate one.
+	isNewFile := false
 	if fileUUID == "" {
 		fileUUID, param.Metadata = vb.getOrCreateUUID(param.Metadata)
+		isNewFile = true
 	} else {
 		// Ensure the new write carries the UUID forward.
 		if param.Metadata == nil {
@@ -333,7 +359,17 @@ func (vb *VersioningBackend) PutBlob(param *PutBlobInput) (*PutBlobOutput, error
 		}
 	}
 
-	return vb.backend.PutBlob(param)
+	out, putErr := vb.backend.PutBlob(param)
+	if putErr != nil {
+		return out, putErr
+	}
+
+	// Write current-path marker for UUID-to-path lookup (new files only).
+	if isNewFile {
+		vb.writeCurrentPathMarker(fileUUID, param.Key)
+	}
+
+	return out, nil
 }
 
 // DeleteBlob snapshots the final version before deleting the object. The
@@ -346,8 +382,8 @@ func (vb *VersioningBackend) DeleteBlob(param *DeleteBlobInput) (*DeleteBlobOutp
 
 	// Read the existing file to get UUID and content for final snapshot.
 	data, meta, size, getErr := vb.readFullBlob(param.Key)
+	var fileUUID string
 	if getErr == nil {
-		fileUUID := ""
 		if v, ok := meta["fileuuid"]; ok && v != nil {
 			fileUUID = *v
 		}
@@ -358,7 +394,35 @@ func (vb *VersioningBackend) DeleteBlob(param *DeleteBlobInput) (*DeleteBlobOutp
 		}
 	}
 
-	return vb.backend.DeleteBlob(param)
+	out, delErr := vb.backend.DeleteBlob(param)
+	if delErr != nil {
+		return out, delErr
+	}
+
+	// Update marker to indicate file is deleted.
+	if fileUUID != "" {
+		markerKey := vb.versionPrefix + fileUUID + "/0"
+		timestamp := time.Now().UTC().Format(time.RFC3339)
+		markerMeta := map[string]*string{
+			"fileuuid":   &fileUUID,
+			"filepath":   &param.Key,
+			"version":    PString("0"),
+			"marker":     PString("true"),
+			"deleted":    PString("true"),
+			"updated-at": &timestamp,
+		}
+		_, err := vb.backend.PutBlob(&PutBlobInput{
+			Key:      markerKey,
+			Body:     bytes.NewReader(nil),
+			Size:     PUInt64(0),
+			Metadata: markerMeta,
+		})
+		if err != nil {
+			versionLog.Errorf("DeleteBlob: failed to update marker for uuid=%s: %v", fileUUID, err)
+		}
+	}
+
+	return out, nil
 }
 
 // DeleteBlobs calls DeleteBlob individually for keys that require versioning,
@@ -421,7 +485,17 @@ func (vb *VersioningBackend) CopyBlob(param *CopyBlobInput) (*CopyBlobOutput, er
 		param.Metadata = merged
 	}
 
-	return vb.backend.CopyBlob(param)
+	out, copyErr := vb.backend.CopyBlob(param)
+	if copyErr != nil {
+		return out, copyErr
+	}
+
+	// Update current-path marker with new path after rename/move.
+	if fileUUID != "" {
+		vb.writeCurrentPathMarker(fileUUID, param.Destination)
+	}
+
+	return out, nil
 }
 
 // MultipartBlobBegin checks if the target file already exists, captures its
@@ -452,10 +526,12 @@ func (vb *VersioningBackend) MultipartBlobBegin(param *MultipartBlobBeginInput) 
 
 	// Get or create UUID for the new upload.
 	var fileUUID string
+	isNewFile := false
 	if snap != nil {
 		fileUUID = snap.uuid
 	} else {
 		fileUUID, param.Metadata = vb.getOrCreateUUID(param.Metadata)
+		isNewFile = true
 	}
 
 	// Ensure metadata carries UUID.
@@ -470,10 +546,22 @@ func (vb *VersioningBackend) MultipartBlobBegin(param *MultipartBlobBeginInput) 
 	}
 
 	// Store pending snapshot keyed by upload ID.
-	if snap != nil && commitInput.UploadId != nil {
-		vb.mu.Lock()
-		vb.pendingMultipart[*commitInput.UploadId] = snap
-		vb.mu.Unlock()
+	// For existing files, snap holds the old content to snapshot at commit time.
+	// For new files, we create a minimal entry to track the UUID and isNewFile flag.
+	if commitInput.UploadId != nil {
+		if snap != nil {
+			vb.mu.Lock()
+			vb.pendingMultipart[*commitInput.UploadId] = snap
+			vb.mu.Unlock()
+		} else if isNewFile {
+			vb.mu.Lock()
+			vb.pendingMultipart[*commitInput.UploadId] = &pendingSnapshot{
+				uuid:      fileUUID,
+				key:       param.Key,
+				isNewFile: true,
+			}
+			vb.mu.Unlock()
+		}
 	}
 
 	return commitInput, nil
@@ -501,8 +589,14 @@ func (vb *VersioningBackend) MultipartBlobCommit(param *MultipartBlobCommitInput
 		vb.mu.Unlock()
 
 		if ok && snap != nil && param.Key != nil {
-			if _, snapErr := vb.snapshotVersion(snap.key, snap.uuid, bytes.NewReader(snap.content), snap.size, false); snapErr != nil {
-				versionLog.Errorf("MultipartBlobCommit: snapshot failed for %s: %v", *param.Key, snapErr)
+			if snap.isNewFile {
+				// New file: write current-path marker for UUID-to-path lookup.
+				vb.writeCurrentPathMarker(snap.uuid, snap.key)
+			} else {
+				// Existing file: snapshot the old content.
+				if _, snapErr := vb.snapshotVersion(snap.key, snap.uuid, bytes.NewReader(snap.content), snap.size, false); snapErr != nil {
+					versionLog.Errorf("MultipartBlobCommit: snapshot failed for %s: %v", *param.Key, snapErr)
+				}
 			}
 		}
 	}
