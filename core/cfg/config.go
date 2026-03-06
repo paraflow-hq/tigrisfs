@@ -131,6 +131,10 @@ type FlagStorage struct {
 
 	TigrisPrefetch    bool
 	TigrisListContent bool
+
+	// Versioning
+	EnableVersioning bool
+	VersionPrefix    string
 }
 
 func (flags *FlagStorage) GetMimeType(fileName string) (retMime *string) {

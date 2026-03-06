@@ -171,6 +171,10 @@ func NewBackend(bucket string, flags *cfg.FlagStorage) (cloud StorageBackend, er
 		err = fmt.Errorf("Unknown backend config: %T", flags.Backend)
 	}
 
+	if err == nil && flags.EnableVersioning {
+		cloud = NewVersioningBackend(cloud, flags.VersionPrefix)
+	}
+
 	return
 }
 

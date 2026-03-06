@@ -741,6 +741,18 @@ MISC OPTIONS:
 		},
 	}
 
+	miscFlags := []cli.Flag{
+		cli.BoolFlag{
+			Name:  "enable-versioning",
+			Usage: "Enable file versioning - automatically create version snapshots on write/delete",
+		},
+		cli.StringFlag{
+			Name:  "version-prefix",
+			Value: ".versions/",
+			Usage: "Prefix for version storage in the bucket",
+		},
+	}
+
 	clusterFlags := []cli.Flag{
 		cli.BoolFlag{
 			Name:  "cluster",
@@ -769,12 +781,12 @@ MISC OPTIONS:
 		Usage:    "Mount an S3 bucket locally",
 		HideHelp: true,
 		Writer:   os.Stderr,
-		Flags: append(append(append(append(append([]cli.Flag{
+		Flags: append(append(append(append(append(append([]cli.Flag{
 			cli.BoolFlag{
 				Name:  "help, h",
 				Usage: "Print this help text and exit successfully.",
 			},
-		}, fsFlags...), s3Flags...), tuningFlags...), debugFlags...), clusterFlags...),
+		}, fsFlags...), s3Flags...), tuningFlags...), debugFlags...), clusterFlags...), miscFlags...),
 	}
 
 	funcMap := template.FuncMap{
@@ -797,6 +809,11 @@ MISC OPTIONS:
 		}
 	}
 	for _, f := range debugFlags {
+		for _, n := range strings.Split(f.GetName(), ",") {
+			flagCategories[strings.Trim(n, " ")] = "misc"
+		}
+	}
+	for _, f := range miscFlags {
 		for _, n := range strings.Split(f.GetName(), ",") {
 			flagCategories[strings.Trim(n, " ")] = "misc"
 		}
@@ -957,6 +974,10 @@ func PopulateFlags(c *cli.Context) (ret *FlagStorage) {
 
 		TigrisPrefetch:    c.Bool("tigris-prefetch"),
 		TigrisListContent: c.Bool("tigris-list-content"),
+
+		// Versioning
+		EnableVersioning: c.Bool("enable-versioning"),
+		VersionPrefix:    c.String("version-prefix"),
 	}
 
 	if runtime.GOOS == "windows" {
